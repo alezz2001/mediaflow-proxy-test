@@ -313,7 +313,7 @@ async def hls_segment_proxy(
     segment_url: str = Query(..., description="URL of the HLS segment"),
 ):
     """
-    Proxy HLS segments with optional pre-buffering support.
+    Proxy HLS segments with optional pre-buffering support and automatic decryption.
 
     Args:
         request (Request): The incoming HTTP request.
@@ -321,8 +321,9 @@ async def hls_segment_proxy(
         proxy_headers (ProxyRequestHeaders): The headers to include in the request.
 
     Returns:
-        Response: The HTTP response with the segment content.
+        Response: The HTTP response with the segment content (decrypted if needed).
     """
+    import asyncio
     from mediaflow_proxy.utils.hls_prebuffer import hls_prebuffer
     from mediaflow_proxy.configs import settings
 
@@ -335,11 +336,11 @@ async def hls_segment_proxy(
         if key.startswith("h_"):
             headers[key[2:]] = value
 
-    # Try to get segment from pre-buffer cache first
+    # Try to get segment from pre-buffer cache first (already decrypted)
     if settings.enable_hls_prebuffer:
         cached_segment = await hls_prebuffer.get_segment(segment_url, headers)
         if cached_segment:
-            # Avvia prebuffer dei successivi in background
+            # Start prebuffer of next segments in background
             asyncio.create_task(hls_prebuffer.prebuffer_from_segment(segment_url, headers))
             return Response(
                 content=cached_segment,
@@ -351,12 +352,12 @@ async def hls_segment_proxy(
                 }
             )
 
-    # Fallback to direct streaming se non in cache:
-    # prima di restituire, prova comunque a far partire il prebuffer dei successivi
+    # Fallback to direct streaming if not in cache
+    # Try to start prebuffer of next segments anyway
     if settings.enable_hls_prebuffer:
         asyncio.create_task(hls_prebuffer.prebuffer_from_segment(segment_url, headers))
+    
     return await handle_stream_request("GET", segment_url, proxy_headers)
-
 
 @proxy_router.get("/dash/segment")
 async def dash_segment_proxy(
