@@ -56,6 +56,9 @@ Set the following environment variables:
 - `HLS_PREBUFFER_CACHE_SIZE`: Optional. Maximum number of HLS segments to keep in memory cache. Default: `50`. Only effective when `ENABLE_HLS_PREBUFFER` is `true`.
 - `HLS_PREBUFFER_MAX_MEMORY_PERCENT`: Optional. Maximum percentage of system memory to use for HLS pre-buffer cache. Default: `80`. Only effective when `ENABLE_HLS_PREBUFFER` is `true`.
 - `HLS_PREBUFFER_EMERGENCY_THRESHOLD`: Optional. Emergency threshold (%) to trigger aggressive HLS cache cleanup. Default: `90`. Only effective when `ENABLE_HLS_PREBUFFER` is `true`.
+- `HLS_NORMALIZE_SEGMENTS`: Optional. Enables HLS segment URL normalization for unconventional extensions (e.g., .css) used by some providers like DLHD. Default: `false`. When enabled, segment URLs with non-standard extensions are rewritten to use a standard extension while preserving the original URL for fetching and caching.
+- `HLS_NORMALIZED_EXTENSION`: Optional. The extension to present to the player for normalized segments. Default: `ts`. Only effective when `HLS_NORMALIZE_SEGMENTS` is `true`.
+- `HLS_NORMALIZED_MAP_SIZE`: Optional. Maximum number of LRU mapping entries for normalized segments. Default: `300`. Only effective when `HLS_NORMALIZE_SEGMENTS` is `true`.
 - `ENABLE_DASH_PREBUFFER`: Optional. Enables DASH pre-buffering for improved streaming performance. Default: `false`. Enable this when you experience frequent buffering or want to improve playback smoothness for high-bitrate streams. Note that enabling pre-buffering increases memory usage and may not be suitable for low-memory environments.
 - `DASH_PREBUFFER_SEGMENTS`: Optional. Number of DASH segments to pre-buffer ahead. Default: `5`. Only effective when `ENABLE_DASH_PREBUFFER` is `true`.
 - `DASH_PREBUFFER_CACHE_SIZE`: Optional. Maximum number of DASH segments to keep in memory cache. Default: `50`. Only effective when `ENABLE_DASH_PREBUFFER` is `true`.

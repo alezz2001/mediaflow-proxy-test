@@ -41,17 +41,11 @@ class TransportConfig(BaseSettings):
             )
 
         # Hardcoded configuration for jxoplay.xyz domain - SSL verification disabled
-        mounts["all://jxoplay.xyz"] = transport_cls(
-            verify=False, proxy=self.proxy_url if self.all_proxy else None
-        )
+        mounts["all://jxoplay.xyz"] = transport_cls(verify=False, proxy=self.proxy_url if self.all_proxy else None)
 
-        mounts["all://dlhd.dad"] = transport_cls(
-            verify=False, proxy=self.proxy_url if self.all_proxy else None
-        )
-        
-        mounts["all://*.newkso.ru"] = transport_cls(
-            verify=False, proxy=self.proxy_url if self.all_proxy else None
-        )
+        mounts["all://dlhd.dad"] = transport_cls(verify=False, proxy=self.proxy_url if self.all_proxy else None)
+
+        mounts["all://*.newkso.ru"] = transport_cls(verify=False, proxy=self.proxy_url if self.all_proxy else None)
 
         # Set default proxy for all routes if enabled
         if self.all_proxy:
@@ -81,6 +75,11 @@ class Settings(BaseSettings):
     hls_prebuffer_cache_size: int = 50  # Maximum number of segments to cache in memory.
     hls_prebuffer_max_memory_percent: int = 80  # Maximum percentage of system memory to use for HLS pre-buffer cache.
     hls_prebuffer_emergency_threshold: int = 90  # Emergency threshold percentage to trigger aggressive cache cleanup.
+    hls_normalize_segments: bool = (
+        False  # Whether to enable HLS segment URL normalization for unconventional extensions.
+    )
+    hls_normalized_extension: str = "ts"  # Extension to present to player for normalized segments.
+    hls_normalized_map_size: int = 300  # Maximum number of LRU mapping entries for normalized segments.
     enable_dash_prebuffer: bool = False  # Whether to enable DASH pre-buffering for improved streaming performance.
     dash_prebuffer_segments: int = 5  # Number of segments to pre-buffer ahead.
     dash_prebuffer_cache_size: int = 50  # Maximum number of segments to cache in memory.
