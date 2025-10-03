@@ -1,9 +1,12 @@
 import asyncio
 import logging
 import psutil
-from typing import Dict, Optional, List
+import re
+from typing import Dict, Optional, List, Tuple
 from urllib.parse import urlparse, urljoin
 from collections import OrderedDict
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import unpad
 
 import httpx
 from mediaflow_proxy.utils.http_utils import create_httpx_client
@@ -14,11 +17,12 @@ logger = logging.getLogger(__name__)
 
 class HLSPreBuffer:
     """
-    Pre-buffer system for HLS (HTTP Live Streaming) streams with proactive garbage collection
-    and input validation to ensure system stability.
+    Pre-buffer system for HLS (HTTP Live Streaming) streams with proactive garbage collection,
+    input validation, and automatic decryption of AES-128 encrypted segments.
     
     This class implements an intelligent caching mechanism that:
     - Pre-downloads video segments before they're requested
+    - Automatically decrypts AES-128 encrypted segments
     - Maintains an LRU (Least Recently Used) cache
     - Monitors system memory usage
     - Automatically refreshes live playlists
@@ -39,7 +43,7 @@ class HLSPreBuffer:
         self.max_memory_percent = settings.hls_prebuffer_max_memory_percent
         self.emergency_threshold = settings.hls_prebuffer_emergency_threshold
         
-        # LRU cache: stores segment URLs -> binary content
+        # LRU cache: stores segment URLs -> binary content (decrypted if needed)
         # OrderedDict maintains insertion order for LRU eviction
         self.segment_cache: "OrderedDict[str, bytes]" = OrderedDict()
         
@@ -51,8 +55,11 @@ class HLSPreBuffer:
         self.segment_to_playlist: Dict[str, tuple[str, int]] = {}
         
         # Per-playlist metadata and state management
-        # Stores: headers, last_access timestamp, refresh_task, target_duration, all_known_segments
+        # Stores: headers, last_access timestamp, refresh_task, target_duration, all_known_segments, encryption_info
         self.playlist_state: Dict[str, dict] = {}
+        
+        # Cache for encryption keys: key_url -> (key_data, iv)
+        self.key_cache: Dict[str, Tuple[bytes, Optional[bytes]]] = {}
         
         # HTTP client with connection pooling
         self.client = create_httpx_client()
@@ -102,6 +109,9 @@ class HLSPreBuffer:
                 logger.warning(f"No segments found in media playlist: {playlist_url}")
                 return
 
+            # Extract encryption information from the playlist
+            encryption_info = self._extract_encryption_info(playlist_content, playlist_url)
+            
             # Store the segment list for this playlist
             self.segment_urls[playlist_url] = segment_urls
             
@@ -110,7 +120,7 @@ class HLSPreBuffer:
                 self.segment_to_playlist[u] = (playlist_url, idx)
 
             # Pre-download the first N segments (configurable via settings)
-            await self._prebuffer_segments(segment_urls[:self.prebuffer_segments], headers)
+            await self._prebuffer_segments(segment_urls[:self.prebuffer_segments], headers, encryption_info)
             logger.info(f"Pre-buffered {min(self.prebuffer_segments, len(segment_urls))} segments for {playlist_url}")
 
             # Parse the target duration (typical segment length in seconds)
@@ -130,10 +140,121 @@ class HLSPreBuffer:
                     "refresh_task": task,
                     "target_duration": target_duration,
                     # Track ALL segments ever seen for this playlist (for cleanup)
-                    "all_known_segments": set(segment_urls)
+                    "all_known_segments": set(segment_urls),
+                    "encryption_info": encryption_info
                 }
         except Exception as e:
             logger.error(f"Failed to pre-buffer playlist {playlist_url}: {e}")
+
+    def _extract_encryption_info(self, playlist_content: str, base_url: str) -> Optional[Dict]:
+        """
+        Extract encryption information from the playlist.
+        
+        Parses #EXT-X-KEY tags to get encryption method, key URI, and IV.
+        
+        Args:
+            playlist_content: Raw text content of the m3u8 file
+            base_url: Base URL of the playlist (for resolving relative paths)
+            
+        Returns:
+            Dict with encryption info or None if no encryption
+        """
+        for line in playlist_content.splitlines():
+            line = line.strip()
+            if line.startswith('#EXT-X-KEY:'):
+                # Parse the key line
+                method_match = re.search(r'METHOD=([^,\s]+)', line)
+                uri_match = re.search(r'URI="([^"]+)"', line)
+                iv_match = re.search(r'IV=0x([0-9A-Fa-f]+)', line)
+                
+                if method_match and uri_match:
+                    method = method_match.group(1)
+                    key_uri = uri_match.group(1)
+                    iv = iv_match.group(1) if iv_match else None
+                    
+                    # Only support AES-128
+                    if method == "AES-128":
+                        full_key_url = urljoin(base_url, key_uri)
+                        logger.info(f"Found AES-128 encryption: key={full_key_url}, iv={iv}")
+                        return {
+                            "method": method,
+                            "key_url": full_key_url,
+                            "iv": iv
+                        }
+                    elif method != "NONE":
+                        logger.warning(f"Unsupported encryption method: {method}")
+        
+        return None
+
+    async def _get_decryption_key(self, key_url: str, headers: Dict[str, str], iv: Optional[str] = None) -> Tuple[bytes, Optional[bytes]]:
+        """
+        Download and cache the decryption key.
+        
+        Args:
+            key_url: URL of the encryption key
+            headers: HTTP headers for the request
+            iv: Initialization vector (hex string) or None
+            
+        Returns:
+            Tuple of (key_data, iv_bytes)
+        """
+        # Check cache first
+        if key_url in self.key_cache:
+            return self.key_cache[key_url]
+        
+        try:
+            logger.debug(f"Downloading encryption key from: {key_url}")
+            response = await self.client.get(key_url, headers=headers, timeout=10)
+            response.raise_for_status()
+            key_data = response.content
+            
+            # Convert IV from hex string to bytes if provided
+            iv_bytes = bytes.fromhex(iv) if iv else None
+            
+            # Cache the key
+            self.key_cache[key_url] = (key_data, iv_bytes)
+            logger.info(f"Cached encryption key from: {key_url}")
+            
+            return key_data, iv_bytes
+        except Exception as e:
+            logger.error(f"Failed to download encryption key from {key_url}: {e}")
+            raise
+
+    def _decrypt_segment(self, encrypted_data: bytes, key: bytes, iv: Optional[bytes] = None, sequence: int = 0) -> bytes:
+        """
+        Decrypt an AES-128 encrypted segment.
+        
+        Args:
+            encrypted_data: Encrypted segment data
+            key: AES key (16 bytes)
+            iv: Initialization vector (16 bytes) or None
+            sequence: Segment sequence number (used if IV is not provided)
+            
+        Returns:
+            Decrypted segment data
+        """
+        try:
+            # If no IV provided, use sequence number as IV (HLS default)
+            if iv is None:
+                iv = sequence.to_bytes(16, byteorder='big')
+            
+            # Create AES cipher in CBC mode
+            cipher = AES.new(key, AES.MODE_CBC, iv)
+            
+            # Decrypt the data
+            decrypted_data = cipher.decrypt(encrypted_data)
+            
+            # Remove PKCS7 padding
+            try:
+                decrypted_data = unpad(decrypted_data, AES.block_size)
+            except ValueError:
+                # If unpadding fails, return data as-is (might not be padded)
+                logger.warning("Failed to remove padding, returning decrypted data as-is")
+            
+            return decrypted_data
+        except Exception as e:
+            logger.error(f"Failed to decrypt segment: {e}")
+            raise
 
     def _extract_segment_urls(self, playlist_content: str, base_url: str) -> List[str]:
         """
@@ -212,9 +333,9 @@ class HLSPreBuffer:
                     return None
         return None
 
-    async def _prebuffer_segments(self, segment_urls: List[str], headers: Dict[str, str]) -> None:
+    async def _prebuffer_segments(self, segment_urls: List[str], headers: Dict[str, str], encryption_info: Optional[Dict] = None) -> None:
         """
-        Download multiple segments concurrently.
+        Download multiple segments concurrently, decrypting if needed.
         
         Only downloads segments that aren't already cached.
         Uses asyncio.gather for parallel downloads.
@@ -222,9 +343,14 @@ class HLSPreBuffer:
         Args:
             segment_urls: List of segment URLs to download
             headers: HTTP headers for requests
+            encryption_info: Encryption information from playlist
         """
         # Build list of download tasks, skipping already-cached segments
-        tasks = [self._download_segment(url, headers) for url in segment_urls if url not in self.segment_cache]
+        tasks = [
+            self._download_segment(url, headers, encryption_info, idx) 
+            for idx, url in enumerate(segment_urls) 
+            if url not in self.segment_cache
+        ]
         if tasks:
             # Execute all downloads in parallel, catching exceptions individually
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -269,9 +395,9 @@ class HLSPreBuffer:
         while len(self.segment_cache) > self.max_cache_size:
             self.segment_cache.popitem(last=False)
 
-    async def _download_segment(self, segment_url: str, headers: Dict[str, str]) -> None:
+    async def _download_segment(self, segment_url: str, headers: Dict[str, str], encryption_info: Optional[Dict] = None, sequence: int = 0) -> None:
         """
-        Download a single video segment and add it to the cache.
+        Download a single video segment, decrypt if needed, and add it to the cache.
         
         Implements memory-aware downloading: skips download if system memory is high.
         Uses LRU caching with automatic eviction.
@@ -279,6 +405,8 @@ class HLSPreBuffer:
         Args:
             segment_url: URL of the segment to download
             headers: HTTP headers for the request
+            encryption_info: Encryption information (method, key_url, iv)
+            sequence: Segment sequence number (for IV calculation)
         """
         try:
             # Check memory before downloading to prevent OOM
@@ -289,9 +417,27 @@ class HLSPreBuffer:
             # Download with timeout to prevent hanging
             response = await self.client.get(segment_url, headers=headers, timeout=20)
             response.raise_for_status()
+            segment_data = response.content
+
+            # Decrypt if encryption is present
+            if encryption_info and encryption_info.get("method") == "AES-128":
+                try:
+                    key_url = encryption_info["key_url"]
+                    iv_hex = encryption_info.get("iv")
+                    
+                    # Get the decryption key
+                    key, iv = await self._get_decryption_key(key_url, headers, iv_hex)
+                    
+                    # Decrypt the segment
+                    segment_data = self._decrypt_segment(segment_data, key, iv, sequence)
+                    logger.debug(f"Decrypted segment: {segment_url}")
+                except Exception as e:
+                    logger.error(f"Failed to decrypt segment {segment_url}: {e}")
+                    # Don't cache encrypted segments that failed to decrypt
+                    return
 
             # Add to cache and mark as most recently used
-            self.segment_cache[segment_url] = response.content
+            self.segment_cache[segment_url] = segment_data
             self.segment_cache.move_to_end(segment_url)
             
             # Enforce cache limits after adding new segment
@@ -307,7 +453,7 @@ class HLSPreBuffer:
         
         This is the main method called by the streaming proxy. It:
         1. Checks cache first (fast path)
-        2. Downloads if not cached (slow path)
+        2. Downloads and decrypts if not cached (slow path)
         3. Updates access time for inactivity tracking
         
         Args:
@@ -315,13 +461,13 @@ class HLSPreBuffer:
             headers: HTTP headers for download (if needed)
             
         Returns:
-            Segment binary data, or None if download failed
+            Segment binary data (decrypted if needed), or None if download failed
         """
         # Update last access time for the playlist containing this segment
         # This keeps the refresh task alive for active streams
         playlist_info = self.segment_to_playlist.get(segment_url)
         if playlist_info:
-            playlist_url, _ = playlist_info
+            playlist_url, segment_index = playlist_info
             if playlist_url in self.playlist_state:
                 self.playlist_state[playlist_url]["last_access"] = asyncio.get_event_loop().time()
 
@@ -334,7 +480,15 @@ class HLSPreBuffer:
 
         # Slow path: cache miss, download on-demand
         logger.debug(f"Cache miss for segment: {segment_url}. Downloading...")
-        await self._download_segment(segment_url, headers)
+        
+        # Get encryption info if available
+        encryption_info = None
+        if playlist_info:
+            playlist_url, segment_index = playlist_info
+            state = self.playlist_state.get(playlist_url, {})
+            encryption_info = state.get("encryption_info")
+        
+        await self._download_segment(segment_url, headers, encryption_info, segment_index)
         return self.segment_cache.get(segment_url)
 
     async def prebuffer_from_segment(self, segment_url: str, headers: Dict[str, str]) -> None:
@@ -356,15 +510,17 @@ class HLSPreBuffer:
         playlist_url, current_index = playlist_info
         
         # Update activity timestamp
-        if playlist_url in self.playlist_state:
-            self.playlist_state[playlist_url]["last_access"] = asyncio.get_event_loop().time()
+        state = self.playlist_state.get(playlist_url)
+        if state:
+            state["last_access"] = asyncio.get_event_loop().time()
 
         # Get the full segment list and calculate which segments to pre-buffer
         all_segments = self.segment_urls.get(playlist_url, [])
         segments_to_prebuffer = all_segments[current_index + 1 : current_index + 1 + self.prebuffer_segments]
         
         if segments_to_prebuffer:
-            await self._prebuffer_segments(segments_to_prebuffer, headers)
+            encryption_info = state.get("encryption_info") if state else None
+            await self._prebuffer_segments(segments_to_prebuffer, headers, encryption_info)
 
     def _cleanup_playlist_resources(self, playlist_url: str):
         """
@@ -375,6 +531,7 @@ class HLSPreBuffer:
         - All cached segments (including historical ones)
         - Segment-to-playlist mappings
         - Playlist state and metadata
+        - Cached encryption keys
         
         Args:
             playlist_url: URL of the playlist to clean up
@@ -398,6 +555,11 @@ class HLSPreBuffer:
         # Remove playlist's segment list
         self.segment_urls.pop(playlist_url, None)
         
+        # Clean up encryption key cache for this playlist
+        encryption_info = state.get('encryption_info')
+        if encryption_info and 'key_url' in encryption_info:
+            self.key_cache.pop(encryption_info['key_url'], None)
+        
         logger.info(f"Cleaned up {len(all_segments_for_playlist)} historical segments for playlist: {playlist_url}")
 
     async def _refresh_playlist_loop(self, playlist_url: str, headers: Dict[str, str], target_duration: int) -> None:
@@ -408,8 +570,9 @@ class HLSPreBuffer:
         appear as the stream progresses. This task:
         1. Periodically re-downloads the playlist
         2. Updates the segment list
-        3. Removes stale segments from cache
-        4. Terminates after inactivity or repeated failures
+        3. Updates encryption info if changed
+        4. Removes stale segments from cache
+        5. Terminates after inactivity or repeated failures
         
         Args:
             playlist_url: URL of the playlist to refresh
@@ -453,6 +616,12 @@ class HLSPreBuffer:
                 new_target_duration = self._parse_target_duration(content)
                 if new_target_duration:
                     sleep_s = max(2, min(15, new_target_duration))
+                
+                # Update encryption info if changed
+                new_encryption_info = self._extract_encryption_info(content, playlist_url)
+                if new_encryption_info != state.get("encryption_info"):
+                    logger.info(f"Encryption info updated for {playlist_url}")
+                    state["encryption_info"] = new_encryption_info
                 
                 # Compare old and new segment lists
                 old_urls_set = set(self.segment_urls.get(playlist_url, []))
@@ -500,6 +669,7 @@ class HLSPreBuffer:
         self.segment_urls.clear()
         self.segment_to_playlist.clear()
         self.playlist_state.clear()
+        self.key_cache.clear()
         logger.info("HLS pre-buffer cache completely cleared.")
     
     async def close(self) -> None:
