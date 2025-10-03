@@ -75,6 +75,10 @@ async def extract_url(
 
         if "no_proxy" in request.query_params:
             response["query_params"]["no_proxy"] = request.query_params.get("no_proxy")
+        
+        # Pass enable_hls_decryption flag from extractor to query params
+        if response.get("enable_hls_decryption"):
+            response["query_params"]["enable_hls_decryption"] = "true"
 
         if extractor_params.redirect_stream:
             stream_url = encode_mediaflow_proxy_url(

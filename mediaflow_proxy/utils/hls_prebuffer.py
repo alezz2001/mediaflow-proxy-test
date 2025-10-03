@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import psutil
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Tuple
 from urllib.parse import urlparse, urljoin
 from collections import OrderedDict
 
@@ -51,13 +51,14 @@ class HLSPreBuffer:
         self.segment_to_playlist: Dict[str, tuple[str, int]] = {}
         
         # Per-playlist metadata and state management
-        # Stores: headers, last_access timestamp, refresh_task, target_duration, all_known_segments
+        # Stores: headers, last_access timestamp, refresh_task, target_duration, all_known_segments,
+        # encryption_info (key_url, iv, key_bytes), enable_decryption
         self.playlist_state: Dict[str, dict] = {}
         
         # HTTP client with connection pooling
         self.client = create_httpx_client()
 
-    async def prebuffer_playlist(self, playlist_url: str, headers: Dict[str, str]) -> None:
+    async def prebuffer_playlist(self, playlist_url: str, headers: Dict[str, str], enable_decryption: bool = False) -> None:
         """
         Main entry point: Start pre-buffering segments from an HLS playlist.
         
@@ -67,13 +68,14 @@ class HLSPreBuffer:
         Args:
             playlist_url: URL of the HLS playlist (m3u8 file)
             headers: HTTP headers to use for requests (authentication, user-agent, etc.)
+            enable_decryption: If True, decrypt segments encrypted with AES-128
         """
         # --- CRITICAL INPUT VALIDATION ---
         # Prevents the "ghost stream" bug: stops the system from treating video segments
         # (which end in .ts, .mp4, etc.) as if they were playlists.
         # Without this check, the system would try to parse binary video data as text,
         # creating phantom streams that never clean up.
-        if playlist_url.endswith(('.ts', '.mp4', '.m4s', '.vtt', '.aac', '.mp3')):
+        if playlist_url.endswith(('.ts', '.mp4', '.m4s', '.vtt', '.aac', '.mp3', '.css')):
             logger.warning(f"Attempted to prebuffer a segment URL as a playlist. Skipping: {playlist_url}")
             return
 
@@ -91,7 +93,7 @@ class HLSPreBuffer:
                 variant_urls = self._extract_variant_urls(playlist_content, playlist_url)
                 if variant_urls:
                     # Recursively process the first variant as a media playlist
-                    await self.prebuffer_playlist(variant_urls[0], headers)
+                    await self.prebuffer_playlist(variant_urls[0], headers, enable_decryption)
                 else:
                     logger.warning("No variants found in master playlist.")
                 return
@@ -109,8 +111,28 @@ class HLSPreBuffer:
             for idx, u in enumerate(segment_urls):
                 self.segment_to_playlist[u] = (playlist_url, idx)
 
+            # Check for encryption and extract encryption info if decryption is enabled
+            encryption_info = None
+            if enable_decryption:
+                from mediaflow_proxy.utils.hls_decryption import parse_m3u8_encryption_info
+                encryption_info = parse_m3u8_encryption_info(playlist_content, playlist_url)
+                
+                if encryption_info:
+                    key_url, iv = encryption_info
+                    logger.info(f"Detected AES-128 encryption. Key URL: {key_url}")
+                    
+                    # Fetch the decryption key
+                    try:
+                        from mediaflow_proxy.utils.hls_decryption import hls_decryptor
+                        key_bytes = await hls_decryptor.get_decryption_key(key_url, headers, self.client)
+                        encryption_info = (key_url, iv, key_bytes)
+                        logger.info(f"Successfully fetched decryption key ({len(key_bytes)} bytes)")
+                    except Exception as e:
+                        logger.error(f"Failed to fetch decryption key: {e}")
+                        encryption_info = None
+
             # Pre-download the first N segments (configurable via settings)
-            await self._prebuffer_segments(segment_urls[:self.prebuffer_segments], headers)
+            await self._prebuffer_segments(segment_urls[:self.prebuffer_segments], headers, encryption_info)
             logger.info(f"Pre-buffered {min(self.prebuffer_segments, len(segment_urls))} segments for {playlist_url}")
 
             # Parse the target duration (typical segment length in seconds)
@@ -130,7 +152,9 @@ class HLSPreBuffer:
                     "refresh_task": task,
                     "target_duration": target_duration,
                     # Track ALL segments ever seen for this playlist (for cleanup)
-                    "all_known_segments": set(segment_urls)
+                    "all_known_segments": set(segment_urls),
+                    "encryption_info": encryption_info,
+                    "enable_decryption": enable_decryption
                 }
         except Exception as e:
             logger.error(f"Failed to pre-buffer playlist {playlist_url}: {e}")
@@ -212,7 +236,7 @@ class HLSPreBuffer:
                     return None
         return None
 
-    async def _prebuffer_segments(self, segment_urls: List[str], headers: Dict[str, str]) -> None:
+    async def _prebuffer_segments(self, segment_urls: List[str], headers: Dict[str, str], encryption_info: Optional[Tuple] = None) -> None:
         """
         Download multiple segments concurrently.
         
@@ -222,9 +246,10 @@ class HLSPreBuffer:
         Args:
             segment_urls: List of segment URLs to download
             headers: HTTP headers for requests
+            encryption_info: Optional tuple of (key_url, iv, key_bytes) for decryption
         """
         # Build list of download tasks, skipping already-cached segments
-        tasks = [self._download_segment(url, headers) for url in segment_urls if url not in self.segment_cache]
+        tasks = [self._download_segment(url, headers, encryption_info) for url in segment_urls if url not in self.segment_cache]
         if tasks:
             # Execute all downloads in parallel, catching exceptions individually
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -269,16 +294,18 @@ class HLSPreBuffer:
         while len(self.segment_cache) > self.max_cache_size:
             self.segment_cache.popitem(last=False)
 
-    async def _download_segment(self, segment_url: str, headers: Dict[str, str]) -> None:
+    async def _download_segment(self, segment_url: str, headers: Dict[str, str], encryption_info: Optional[Tuple] = None) -> None:
         """
         Download a single video segment and add it to the cache.
         
         Implements memory-aware downloading: skips download if system memory is high.
         Uses LRU caching with automatic eviction.
+        Optionally decrypts encrypted segments.
         
         Args:
             segment_url: URL of the segment to download
             headers: HTTP headers for the request
+            encryption_info: Optional tuple of (key_url, iv, key_bytes) for decryption
         """
         try:
             # Check memory before downloading to prevent OOM
@@ -289,9 +316,38 @@ class HLSPreBuffer:
             # Download with timeout to prevent hanging
             response = await self.client.get(segment_url, headers=headers, timeout=20)
             response.raise_for_status()
+            
+            segment_data = response.content
+            
+            # Decrypt if encryption info is provided
+            if encryption_info:
+                try:
+                    key_url, iv_hex, key_bytes = encryption_info
+                    
+                    # Convert hex IV to bytes if provided
+                    iv_bytes = None
+                    if iv_hex:
+                        iv_bytes = bytes.fromhex(iv_hex)
+                    else:
+                        # Use segment sequence number as IV (default in HLS)
+                        # Extract sequence from segment_to_playlist mapping
+                        if segment_url in self.segment_to_playlist:
+                            _, sequence = self.segment_to_playlist[segment_url]
+                            # IV is the sequence number as a 16-byte big-endian integer
+                            iv_bytes = sequence.to_bytes(16, byteorder='big')
+                    
+                    # Decrypt the segment
+                    from mediaflow_proxy.utils.hls_decryption import hls_decryptor
+                    segment_data = hls_decryptor.decrypt_segment(segment_data, key_bytes, iv_bytes)
+                    logger.debug(f"Decrypted segment: {segment_url}")
+                    
+                except Exception as e:
+                    logger.error(f"Failed to decrypt segment {segment_url}: {e}")
+                    # Don't cache encrypted data if decryption fails
+                    return
 
             # Add to cache and mark as most recently used
-            self.segment_cache[segment_url] = response.content
+            self.segment_cache[segment_url] = segment_data
             self.segment_cache.move_to_end(segment_url)
             
             # Enforce cache limits after adding new segment
@@ -320,10 +376,13 @@ class HLSPreBuffer:
         # Update last access time for the playlist containing this segment
         # This keeps the refresh task alive for active streams
         playlist_info = self.segment_to_playlist.get(segment_url)
+        encryption_info = None
         if playlist_info:
             playlist_url, _ = playlist_info
             if playlist_url in self.playlist_state:
                 self.playlist_state[playlist_url]["last_access"] = asyncio.get_event_loop().time()
+                # Get encryption info if available
+                encryption_info = self.playlist_state[playlist_url].get("encryption_info")
 
         # Fast path: cache hit
         if segment_url in self.segment_cache:
@@ -334,7 +393,7 @@ class HLSPreBuffer:
 
         # Slow path: cache miss, download on-demand
         logger.debug(f"Cache miss for segment: {segment_url}. Downloading...")
-        await self._download_segment(segment_url, headers)
+        await self._download_segment(segment_url, headers, encryption_info)
         return self.segment_cache.get(segment_url)
 
     async def prebuffer_from_segment(self, segment_url: str, headers: Dict[str, str]) -> None:
@@ -355,16 +414,18 @@ class HLSPreBuffer:
         
         playlist_url, current_index = playlist_info
         
-        # Update activity timestamp
+        # Get encryption info if available
+        encryption_info = None
         if playlist_url in self.playlist_state:
             self.playlist_state[playlist_url]["last_access"] = asyncio.get_event_loop().time()
+            encryption_info = self.playlist_state[playlist_url].get("encryption_info")
 
         # Get the full segment list and calculate which segments to pre-buffer
         all_segments = self.segment_urls.get(playlist_url, [])
         segments_to_prebuffer = all_segments[current_index + 1 : current_index + 1 + self.prebuffer_segments]
         
         if segments_to_prebuffer:
-            await self._prebuffer_segments(segments_to_prebuffer, headers)
+            await self._prebuffer_segments(segments_to_prebuffer, headers, encryption_info)
 
     def _cleanup_playlist_resources(self, playlist_url: str):
         """

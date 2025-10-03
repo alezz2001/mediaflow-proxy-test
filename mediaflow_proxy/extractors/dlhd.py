@@ -399,24 +399,69 @@ class DLHDExtractor(BaseExtractor):
                     clean_m3u8_url = f'https://{server_key}new.newkso.ru/{server_key}/{channel_key}/mono.m3u8'
                 logger.info(f'Using generated URL for server_key \'{server_key}\': {clean_m3u8_url}')
 
-            # If newkso.ru domain, switch to hls_key_proxy and use iframe referer
-            if "newkso.ru" in clean_m3u8_url:
-                self.mediaflow_endpoint = "hls_key_proxy"
-                stream_headers = {
+            # Check if stream has encrypted segments by fetching the manifest
+            # and looking for AES-128 encryption
+            needs_decryption = False
+            try:
+                # Fetch the M3U8 to check for encryption
+                m3u8_headers = {
                     'User-Agent': daddylive_headers['User-Agent'],
-                    'Referer': iframe_url,
+                    'Referer': iframe_url if "newkso.ru" in clean_m3u8_url else referer_raw,
                     'Origin': referer_raw
                 }
-                logger.info("Using 'hls_key_proxy' for newkso.ru stream. Only the key will be proxied.")
+                m3u8_resp = await self._make_request(clean_m3u8_url, headers=m3u8_headers, timeout=10)
+                m3u8_content = m3u8_resp.text
+                
+                # Check for AES-128 encryption and .css segments
+                from mediaflow_proxy.utils.hls_decryption import has_encrypted_segments
+                has_encryption = has_encrypted_segments(m3u8_content)
+                has_css_segments = '.css' in m3u8_content.lower()
+                
+                needs_decryption = has_encryption or has_css_segments
+                
+                if needs_decryption:
+                    logger.info(f"Detected encrypted/CSS segments in DLHD stream. Encryption: {has_encryption}, CSS segments: {has_css_segments}")
+            except Exception as e:
+                logger.warning(f"Could not check for encryption in manifest: {e}. Assuming decryption needed.")
+                needs_decryption = True
+            
+            # If segments need decryption, use full HLS manifest proxy with decryption enabled
+            # Otherwise, use key-only proxy
+            if needs_decryption:
+                self.mediaflow_endpoint = "hls_manifest_proxy"
+                stream_headers = {
+                    'User-Agent': daddylive_headers['User-Agent'],
+                    'Referer': iframe_url if "newkso.ru" in clean_m3u8_url else referer_raw,
+                    'Origin': referer_raw
+                }
+                logger.info("Using 'hls_manifest_proxy' with decryption for DLHD stream with encrypted segments.")
+                
+                # Return additional metadata to indicate decryption is needed
+                return {
+                    "destination_url": clean_m3u8_url,
+                    "request_headers": stream_headers,
+                    "mediaflow_endpoint": self.mediaflow_endpoint,
+                    "enable_hls_decryption": True,  # Flag to enable decryption in the proxy
+                }
             else:
-                # Use key-only proxy for all DLHD streams as requested
-                self.mediaflow_endpoint = "hls_key_proxy"
-                stream_headers = {
-                    'User-Agent': daddylive_headers['User-Agent'],
-                    'Referer': referer_raw,
-                    'Origin': referer_raw
-                }
-                logger.info("Using 'hls_key_proxy' for DLHD stream. Only the key will be proxied.")
+                # If newkso.ru domain, switch to hls_key_proxy and use iframe referer
+                if "newkso.ru" in clean_m3u8_url:
+                    self.mediaflow_endpoint = "hls_key_proxy"
+                    stream_headers = {
+                        'User-Agent': daddylive_headers['User-Agent'],
+                        'Referer': iframe_url,
+                        'Origin': referer_raw
+                    }
+                    logger.info("Using 'hls_key_proxy' for newkso.ru stream. Only the key will be proxied.")
+                else:
+                    # Use key-only proxy for all DLHD streams as requested
+                    self.mediaflow_endpoint = "hls_key_proxy"
+                    stream_headers = {
+                        'User-Agent': daddylive_headers['User-Agent'],
+                        'Referer': referer_raw,
+                        'Origin': referer_raw
+                    }
+                    logger.info("Using 'hls_key_proxy' for DLHD stream. Only the key will be proxied.")
 
             # cache auth data
             self._auth_cache[channel_id] = {

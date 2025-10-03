@@ -83,6 +83,10 @@ class HLSManifestParams(GenericParams):
         False,
         description="If true, redirects to the highest resolution stream in the manifest.",
     )
+    enable_hls_decryption: bool = Field(
+        False,
+        description="If true, decrypt encrypted HLS segments using AES-128 before serving them.",
+    )
 
 
 class MPDManifestParams(GenericParams):

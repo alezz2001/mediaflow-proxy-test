@@ -11,7 +11,7 @@ from mediaflow_proxy.utils.hls_prebuffer import hls_prebuffer
 
 
 class M3U8Processor:
-    def __init__(self, request, key_url: str = None, force_playlist_proxy: bool = None, key_only_proxy: bool = False, no_proxy: bool = False):
+    def __init__(self, request, key_url: str = None, force_playlist_proxy: bool = None, key_only_proxy: bool = False, no_proxy: bool = False, enable_decryption: bool = False):
         """
         Initializes the M3U8Processor with the request and URL prefix.
 
@@ -21,12 +21,14 @@ class M3U8Processor:
             force_playlist_proxy (bool, optional): Force all playlist URLs to be proxied through MediaFlow. Defaults to None.
             key_only_proxy (bool, optional): Only proxy the key URL, leaving segment URLs direct. Defaults to False.
             no_proxy (bool, optional): If True, returns the manifest without proxying any URLs. Defaults to False.
+            enable_decryption (bool, optional): If True, decrypt encrypted segments using AES-128. Defaults to False.
         """
         self.request = request
         self.key_url = parse.urlparse(key_url) if key_url else None
         self.key_only_proxy = key_only_proxy
         self.no_proxy = no_proxy
         self.force_playlist_proxy = force_playlist_proxy
+        self.enable_decryption = enable_decryption
         self.mediaflow_proxy_url = str(
             request.url_for("hls_manifest_proxy").replace(scheme=get_original_scheme(request))
         )
@@ -56,8 +58,9 @@ class M3U8Processor:
             else:
                 processed_lines.append(line)
         
-        # Pre-buffer segments if enabled and this is a playlist
-        if (settings.enable_hls_prebuffer and 
+        # Pre-buffer segments if enabled OR if decryption is required
+        # Decryption requires prebuffering to work properly
+        if ((settings.enable_hls_prebuffer or self.enable_decryption) and 
             "#EXTM3U" in content and
             self.playlist_url):
             
@@ -69,7 +72,7 @@ class M3U8Processor:
             
             # Start pre-buffering in background using the actual playlist URL
             asyncio.create_task(
-                hls_prebuffer.prebuffer_playlist(self.playlist_url, headers)
+                hls_prebuffer.prebuffer_playlist(self.playlist_url, headers, self.enable_decryption)
             )
         
         return "\n".join(processed_lines)
@@ -123,7 +126,8 @@ class M3U8Processor:
 
             # Start pre-buffering early once we detect this is a playlist
             # This avoids waiting until the entire playlist is processed
-            if (settings.enable_hls_prebuffer and 
+            # Enable prebuffering if either the setting is on OR decryption is required
+            if ((settings.enable_hls_prebuffer or self.enable_decryption) and 
                 is_playlist_detected and 
                 not is_prebuffer_started and
                 self.playlist_url):
@@ -136,7 +140,7 @@ class M3U8Processor:
                 
                 # Start pre-buffering in background using the actual playlist URL
                 asyncio.create_task(
-                    hls_prebuffer.prebuffer_playlist(self.playlist_url, headers)
+                    hls_prebuffer.prebuffer_playlist(self.playlist_url, headers, self.enable_decryption)
                 )
                 is_prebuffer_started = True
 
@@ -214,8 +218,9 @@ class M3U8Processor:
         if self.no_proxy:
             return full_url
 
-        # If key_only_proxy is enabled, return the direct URL for segments
-        if self.key_only_proxy and not url.endswith((".m3u", ".m3u8")):
+        # If key_only_proxy is enabled AND decryption is disabled, return the direct URL for segments
+        # When decryption is enabled, we MUST proxy segments to decrypt them
+        if self.key_only_proxy and not self.enable_decryption and not url.endswith((".m3u", ".m3u8")):
             return full_url
 
         # Determine routing strategy based on configuration
