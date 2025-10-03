@@ -61,8 +61,9 @@ class HLSPreBuffer:
         # Cache for encryption keys: key_url -> (key_data, iv)
         self.key_cache: Dict[str, Tuple[bytes, Optional[bytes]]] = {}
         
-        # HTTP client with connection pooling
-        self.client = create_httpx_client()
+        # HTTP client with connection pooling and SSL verification disabled
+        # SSL verification is disabled to support Cloudflare Workers with mismatched certificates
+        self.client = create_httpx_client(verify=False)
 
     async def prebuffer_playlist(self, playlist_url: str, headers: Dict[str, str]) -> None:
         """
@@ -204,9 +205,12 @@ class HLSPreBuffer:
         
         try:
             logger.debug(f"Downloading encryption key from: {key_url}")
+            # Use main client which has SSL verification disabled
             response = await self.client.get(key_url, headers=headers, timeout=10)
             response.raise_for_status()
             key_data = response.content
+            
+            logger.info(f"Downloaded encryption key: {len(key_data)} bytes")
             
             # Convert IV from hex string to bytes if provided
             iv_bytes = bytes.fromhex(iv) if iv else None
