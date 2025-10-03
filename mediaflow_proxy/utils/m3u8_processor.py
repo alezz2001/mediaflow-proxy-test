@@ -192,14 +192,29 @@ class M3U8Processor:
         [query_params.pop(key, None) for key in list(query_params.keys()) if key.startswith("r_")]
         query_params.pop("force_playlist_proxy", None)
 
-        # Costruisce URL proxato verso endpoint /stream/<filename>
-        return encode_mediaflow_proxy_url(
-            self.stream_proxy_base,
-            synthetic_filename,
-            full_url,
+        # Forza Content-Type video/mp2t per evitare text/css
+        response_headers = {"Content-Type": "video/mp2t"}
+
+        proxied = encode_mediaflow_proxy_url(
+            mediaflow_proxy_url=self.stream_proxy_base,
+            endpoint=None,
+            destination_url=full_url,
             query_params=query_params,
+            request_headers=None,
+            response_headers=response_headers,
             encryption_handler=encryption_handler if has_encrypted else None,
+            filename=synthetic_filename,
         )
+
+        try:
+            import logging
+            logging.getLogger(__name__).debug(
+                "Riscrittura segmento CSS: originale=%s => proxied=%s", full_url, proxied
+            )
+        except Exception:
+            pass
+
+        return proxied
 
     async def proxy_url(self, url: str, base_url: str, use_full_url: bool = False) -> str:
         if use_full_url:
