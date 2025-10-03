@@ -22,7 +22,7 @@ class DLHDExtractor(BaseExtractor):
 
     def __init__(self, request_headers: dict):
         super().__init__(request_headers)
-        self.mediaflow_endpoint = "hls_manifest_proxy"
+        self.mediaflow_endpoint = "hls_manifest_proxy"  # Cambiato da hls_key_proxy a hls_manifest_proxy
         self._cached_base_url: Optional[str] = None
         self._iframe_context: Optional[str] = None
         self._auth_cache: Dict[str, Dict[str, Any]] = {}
@@ -399,24 +399,13 @@ class DLHDExtractor(BaseExtractor):
                     clean_m3u8_url = f'https://{server_key}new.newkso.ru/{server_key}/{channel_key}/mono.m3u8'
                 logger.info(f'Using generated URL for server_key \'{server_key}\': {clean_m3u8_url}')
 
-            # If newkso.ru domain, switch to hls_key_proxy and use iframe referer
-            if "newkso.ru" in clean_m3u8_url:
-                self.mediaflow_endpoint = "hls_key_proxy"
-                stream_headers = {
-                    'User-Agent': daddylive_headers['User-Agent'],
-                    'Referer': iframe_url,
-                    'Origin': referer_raw
-                }
-                logger.info("Using 'hls_key_proxy' for newkso.ru stream. Only the key will be proxied.")
-            else:
-                # Use key-only proxy for all DLHD streams as requested
-                self.mediaflow_endpoint = "hls_key_proxy"
-                stream_headers = {
-                    'User-Agent': daddylive_headers['User-Agent'],
-                    'Referer': referer_raw,
-                    'Origin': referer_raw
-                }
-                logger.info("Using 'hls_key_proxy' for DLHD stream. Only the key will be proxied.")
+            # Se newkso.ru è nel dominio, usa comunque hls_manifest_proxy per tutti i flussi DLHD
+            stream_headers = {
+                'User-Agent': daddylive_headers['User-Agent'],
+                'Referer': iframe_url,
+                'Origin': referer_raw
+            }
+            logger.info("Using 'hls_manifest_proxy' for DLHD stream. All segments including keys will be proxied.")
 
             # cache auth data
             self._auth_cache[channel_id] = {
