@@ -38,7 +38,7 @@ aiofiles = "^24.1.0"
 beautifulsoup4 = ">=4.13.4"
 lxml = "^5.4.0"
 psutil = "^6.1.0"
-pycryptodome = "^3.19.0"
+pycryptodome = "^3.23.0"
 
 [tool.poetry.group.dev.dependencies]
 black = "^25.1.0"
