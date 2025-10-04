@@ -31,12 +31,62 @@ class DownloadError(Exception):
         super().__init__(message)
 
 
-def create_httpx_client(follow_redirects: bool = True, **kwargs) -> httpx.AsyncClient:
-    """Creates an HTTPX client with configured proxy routing"""
-    mounts = settings.transport_config.get_mounts()
-    kwargs.setdefault("timeout", settings.transport_config.timeout)
-    client = httpx.AsyncClient(mounts=mounts, follow_redirects=follow_redirects, **kwargs)
-    return client
+def should_disable_ssl_verification(url: str) -> bool:
+    """
+    Determina se disabilitare la verifica SSL per un URL.
+    
+    Args:
+        url: URL da verificare
+        
+    Returns:
+        True se la verifica SSL deve essere disabilitata
+    """
+    # Disabilita SSL per Cloudflare Workers (usati da DLHD)
+    # e per domini newkso.ru
+    disable_ssl_patterns = [
+        '.workers.dev',
+        'newkso.ru'
+    ]
+    
+    return any(pattern in url.lower() for pattern in disable_ssl_patterns)
+
+
+def create_httpx_client(
+    headers: dict = None,
+    follow_redirects: bool = True,
+    timeout: httpx.Timeout = None,
+    verify: bool = None,  # Cambia da True a None come default
+    url_hint: str = None,  # Nuovo parametro
+    **kwargs,
+) -> httpx.AsyncClient:
+    """
+    Create an HTTP client with connection pooling and optional settings.
+    
+    Args:
+        headers: Optional headers to include in requests
+        follow_redirects: Whether to follow redirects
+        timeout: Optional timeout configuration
+        verify: SSL verification (None = auto-detect based on URL)
+        url_hint: URL hint per auto-detection SSL verification
+        **kwargs: Additional arguments for AsyncClient
+        
+    Returns:
+        Configured AsyncClient instance
+    """
+    # Auto-detect SSL verification if not explicitly set
+    if verify is None and url_hint:
+        verify = not should_disable_ssl_verification(url_hint)
+    elif verify is None:
+        verify = True  # Default to True if no hint provided
+    
+    return httpx.AsyncClient(
+        headers=headers,
+        follow_redirects=follow_redirects,
+        timeout=timeout or httpx.Timeout(30.0),
+        verify=verify,
+        limits=httpx.Limits(max_keepalive_connections=20, max_connections=100),
+        **kwargs,
+    )
 
 
 @retry(
