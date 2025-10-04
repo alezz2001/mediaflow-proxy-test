@@ -148,7 +148,7 @@ async def handle_stream_request(
     proxy_headers: ProxyRequestHeaders,
 ) -> Response:
     """
-    Handle general stream requests.
+    Handle general stream requests with SSL verification auto-detection.
 
     This function processes both HEAD and GET requests for video streams.
 
@@ -160,7 +160,8 @@ async def handle_stream_request(
     Returns:
         Union[Response, EnhancedStreamingResponse]: Either a HEAD response with headers or a streaming response.
     """
-    client, streamer = await setup_client_and_streamer()
+    # Pass video_url to setup function for SSL auto-detection
+    client, streamer = await setup_client_and_streamer(video_url)
 
     try:
         # Auto-detect and resolve Vavoo links
@@ -195,7 +196,6 @@ async def handle_stream_request(
     except Exception as e:
         await streamer.close()
         return handle_exceptions(e)
-
 
 def prepare_response_headers(original_headers, proxy_response_headers) -> dict:
     """
