@@ -81,7 +81,7 @@ async def handle_hls_stream_proxy(
     Returns:
         Union[Response, EnhancedStreamingResponse]: Either a processed m3u8 playlist or a streaming response.
     """
-    _, streamer = await setup_client_and_streamer()
+    _, streamer = await setup_client_and_streamer(hls_params.destination)
     # Handle range requests
     content_range = proxy_headers.request.get("range", "bytes=0-")
     if "nan" in content_range.casefold():
