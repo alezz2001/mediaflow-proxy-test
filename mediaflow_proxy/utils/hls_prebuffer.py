@@ -400,63 +400,63 @@ class HLSPreBuffer:
             self.segment_cache.popitem(last=False)
 
     async def _download_segment(self, segment_url: str, headers: Dict[str, str], encryption_info: Optional[Dict] = None, sequence: int = 0) -> None:
-    """
-    Download a single video segment, decrypt if needed, and add it to the cache.
-    
-    Implements memory-aware downloading: skips download if system memory is high.
-    Uses LRU caching with automatic eviction.
-    
-    Args:
-        segment_url: URL of the segment to download
-        headers: HTTP headers for the request
-        encryption_info: Encryption information (method, key_url, iv)
-        sequence: Segment sequence number (for IV calculation)
-    """
-    try:
-        # Check memory before downloading to prevent OOM
-        if self._get_memory_usage_percent() > self.max_memory_percent:
-            logger.warning(f"Memory usage high ({self._get_memory_usage_percent()}%). Skipping download of {segment_url}.")
-            return
-
-        # Download with timeout to prevent hanging
-        response = await self.client.get(segment_url, headers=headers, timeout=20)
-        response.raise_for_status()
-        segment_data = response.content
-
-        # Log download info
-        logger.info(f"Downloaded segment {segment_url}: {len(segment_data)} bytes, encryption_info={encryption_info}")
-
-        # Decrypt if encryption is present
-        if encryption_info and encryption_info.get("method") == "AES-128":
-            logger.info(f"Attempting to decrypt segment {segment_url}")
-            try:
-                key_url = encryption_info["key_url"]
-                iv_hex = encryption_info.get("iv")
-                
-                # Get the decryption key
-                key, iv = await self._get_decryption_key(key_url, headers, iv_hex)
-                
-                # Decrypt the segment
-                segment_data = self._decrypt_segment(segment_data, key, iv, sequence)
-                logger.info(f"Successfully decrypted segment: {segment_url}")
-            except Exception as e:
-                logger.error(f"Failed to decrypt segment {segment_url}: {e}")
-                # Don't cache encrypted segments that failed to decrypt
-                return
-        else:
-            logger.info(f"No encryption for segment {segment_url}, encryption_info={encryption_info}")
-
-        # Add to cache and mark as most recently used
-        self.segment_cache[segment_url] = segment_data
-        self.segment_cache.move_to_end(segment_url)
+        """
+        Download a single video segment, decrypt if needed, and add it to the cache.
         
-        # Enforce cache limits after adding new segment
-        self._enforce_cache_limits()
-        logger.debug(f"Cached segment: {segment_url}")
+        Implements memory-aware downloading: skips download if system memory is high.
+        Uses LRU caching with automatic eviction.
+        
+        Args:
+            segment_url: URL of the segment to download
+            headers: HTTP headers for the request
+            encryption_info: Encryption information (method, key_url, iv)
+            sequence: Segment sequence number (for IV calculation)
+        """
+        try:
+            # Check memory before downloading to prevent OOM
+            if self._get_memory_usage_percent() > self.max_memory_percent:
+                logger.warning(f"Memory usage high ({self._get_memory_usage_percent()}%). Skipping download of {segment_url}.")
+                return
 
-    except Exception as e:
-        logger.warning(f"Failed to download segment {segment_url}: {e}")
+            # Download with timeout to prevent hanging
+            response = await self.client.get(segment_url, headers=headers, timeout=20)
+            response.raise_for_status()
+            segment_data = response.content
 
+            # Log download info
+            logger.info(f"Downloaded segment {segment_url}: {len(segment_data)} bytes, encryption_info={encryption_info}")
+
+            # Decrypt if encryption is present
+            if encryption_info and encryption_info.get("method") == "AES-128":
+                logger.info(f"Attempting to decrypt segment {segment_url}")
+                try:
+                    key_url = encryption_info["key_url"]
+                    iv_hex = encryption_info.get("iv")
+                    
+                    # Get the decryption key
+                    key, iv = await self._get_decryption_key(key_url, headers, iv_hex)
+                    
+                    # Decrypt the segment
+                    segment_data = self._decrypt_segment(segment_data, key, iv, sequence)
+                    logger.info(f"Successfully decrypted segment: {segment_url}")
+                except Exception as e:
+                    logger.error(f"Failed to decrypt segment {segment_url}: {e}")
+                    # Don't cache encrypted segments that failed to decrypt
+                    return
+            else:
+                logger.info(f"No encryption for segment {segment_url}, encryption_info={encryption_info}")
+
+            # Add to cache and mark as most recently used
+            self.segment_cache[segment_url] = segment_data
+            self.segment_cache.move_to_end(segment_url)
+            
+            # Enforce cache limits after adding new segment
+            self._enforce_cache_limits()
+            logger.debug(f"Cached segment: {segment_url}")
+
+        except Exception as e:
+            logger.warning(f"Failed to download segment {segment_url}: {e}")
+            
     async def get_segment(self, segment_url: str, headers: Dict[str, str]) -> Optional[bytes]:
         """
         Retrieve a segment from cache or download it on-demand.
@@ -694,6 +694,7 @@ class HLSPreBuffer:
 # Global singleton instance
 # Used across the application to maintain a single cache
 hls_prebuffer = HLSPreBuffer()
+
 
 
 
