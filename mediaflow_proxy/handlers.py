@@ -26,14 +26,19 @@ from .utils.mpd_utils import pad_base64
 logger = logging.getLogger(__name__)
 
 
-async def setup_client_and_streamer() -> tuple[httpx.AsyncClient, Streamer]:
+async def setup_client_and_streamer(video_url: str = None) -> tuple[httpx.AsyncClient, Streamer]:
     """
-    Set up an HTTP client and a streamer.
+    Set up an HTTP client and a streamer with SSL verification auto-detection.
+
+    Args:
+        video_url: Optional URL hint for SSL verification detection
 
     Returns:
         tuple: An httpx.AsyncClient instance and a Streamer instance.
     """
-    client = create_httpx_client()
+    # Auto-detect SSL verification based on URL
+    # Disabilita SSL per Cloudflare Workers e newkso.ru domains
+    client = create_httpx_client(url_hint=video_url)
     return client, Streamer(client)
 
 
