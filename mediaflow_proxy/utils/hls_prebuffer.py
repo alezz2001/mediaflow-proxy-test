@@ -422,7 +422,12 @@ class HLSPreBuffer:
             response = await self.client.get(segment_url, headers=headers, timeout=20)
             response.raise_for_status()
             segment_data = response.content
-            logger.info(f"Downloaded segment {segment_url}: {len(segment_data)} bytes, encryption_info={encryption_info}")
+            if encryption_info and encryption_info.get("method") == "AES-128":
+                logger.info(f"🔐 Attempting to decrypt segment {segment_url}")
+                try:
+                    logger.info(f"Downloaded segment {segment_url}: {len(segment_data)} bytes, encryption_info={encryption_info}")
+            else:
+                logger.info(f"✓ No encryption for segment {segment_url}, encryption_info={encryption_info}")
 
             # Decrypt if encryption is present
             if encryption_info and encryption_info.get("method") == "AES-128":
@@ -689,4 +694,5 @@ class HLSPreBuffer:
 # Global singleton instance
 # Used across the application to maintain a single cache
 hls_prebuffer = HLSPreBuffer()
+
 
